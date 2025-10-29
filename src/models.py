@@ -1003,6 +1003,550 @@ class FreqDINO(nn.Module):
 
 
 
+# ============================================================================
+# ABLATION MODELS
+# ============================================================================
+
+class FreqDINO_ablation1(nn.Module):
+    # Ablation 1: Remove Noise Bank (no noise tokens in cross-attention)
+    def __init__(self, n_fusion_layers=3, n_heads=8, d_model=768,
+                 dino_embed_size=1024, n_patches=196, clip_layers=12, num_classes=3,
+                 n_bands=3):
+        super().__init__()
+        self.dino_embed_size = dino_embed_size
+        self.n_patches = n_patches
+        self.grid = int(math.sqrt(n_patches))
+        self.n_bands = n_bands
+
+        self.freq = EnhancedFrequencyBank(in_ch=3, base_ch=64)
+        self.fft_bank = FFTBankv2(out_dim=dino_embed_size, grid=self.grid, n_bands=self.n_bands)
+        fft_out_ch = self.fft_bank.out_channels
+
+        self.clip_weight = ClipLayerWeighting(n_layers=clip_layers, embed_dim=768)
+        self.clip_proj = nn.Linear(768, d_model)
+        self.dino_proj = nn.Linear(dino_embed_size, d_model)
+        self.patch_proj = nn.Linear(dino_embed_size, d_model)
+        self.fft_to_dmodel = nn.Linear(fft_out_ch, d_model)
+        self.phase_to_dmodel = nn.Linear(fft_out_ch, d_model)
+
+        self.pos = PositionalEncoding(d_model, max_len=n_patches + 4)
+        self.cross_layers = nn.ModuleList([CrossAttentionLayer(d_model, n_heads) for _ in range(n_fusion_layers)])
+        
+        # NO NoiseResidualBank in this ablation
+
+        self.classifier_head = nn.Sequential(
+            nn.Linear(d_model * 3 + 64, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, num_classes)
+        )
+        self.seg_decoder = FusedSegmentationDecoder(
+            patch_dim=dino_embed_size,
+            freq_dim=fft_out_ch,
+            fused_dim=d_model,
+            patch_count=n_patches,
+            out_size=224,
+            mid_ch=512
+        )
+        self.aux_seg_proj = nn.Conv2d(64, 128, 1)
+        self.norm = nn.LayerNorm(d_model)
+        self.bc_pca_clip = BC_PCA(d_model=d_model, n_bands=self.n_bands)
+
+    def forward(self, image, clip_embed, dino_cls, dino_reg, dino_patch, has_mask=None, mask=None):
+        B = image.shape[0]
+
+        f = self.freq(image)
+        f_pool = F.adaptive_avg_pool2d(f, 1).view(B, -1)
+
+        clip_w = self.clip_weight(clip_embed)
+        clip_proj = self.clip_proj(clip_w)
+
+        patch_tokens = dino_patch
+        patch_proj = self.patch_proj(patch_tokens)
+        patch_seq = patch_proj.permute(1,0,2)
+
+        dino_cls_proj = self.dino_proj(dino_cls) if dino_cls.ndim==2 else self.dino_proj(dino_cls.view(B,-1))
+        dino_cls_tok = dino_cls_proj.unsqueeze(0)
+
+        mag_bands_raw, phase_bands_raw, fft_mag = self.fft_bank(image)
+        mag_bands = [self.fft_to_dmodel(band) for band in mag_bands_raw]
+        phase_bands = [self.phase_to_dmodel(band) for band in phase_bands_raw]
+
+        clip_tok_batch = clip_proj.unsqueeze(1)
+        
+        # No noise tokens
+        
+        fused_clip_batch = self.bc_pca_clip(clip_tok_batch, mag_bands, phase_bands)
+        fused_clip = fused_clip_batch.squeeze(1)
+
+        freq_proj_dmodel = torch.stack(mag_bands, dim=0).mean(dim=0)
+        freq_seq = freq_proj_dmodel.permute(1,0,2)
+
+        # Cross-attention without noise
+        q2 = dino_cls_tok
+        k2 = torch.cat([patch_seq, fused_clip.unsqueeze(0)], dim=0)
+        v2 = k2
+        for layer in self.cross_layers:
+            q2 = layer(q2, k2, v2)
+        fused_dino_cls = q2.squeeze(0)
+
+        q3 = patch_seq
+        k3 = torch.cat([patch_seq, fused_clip.unsqueeze(0), fused_dino_cls.unsqueeze(0)], dim=0)
+        v3 = k3
+        for layer in self.cross_layers:
+            q3 = layer(q3, k3, v3)
+        fused_patches = q3.permute(1, 0, 2)
+
+        cls_input = torch.cat([f_pool, fused_clip, fused_dino_cls, clip_proj], dim=1)
+        logits = self.classifier_head(cls_input)
+
+        seg_decoder_freq_tokens = mag_bands_raw[1]
+        seg_logits = self.seg_decoder(dino_patch, seg_decoder_freq_tokens, fused_patches)
+
+        seg_loss = None
+
+        if (mask is not None) and (has_mask is not None):
+             return {
+                 "logits": logits,
+                 "seg_logits": seg_logits,
+                 "seg_loss": seg_loss,
+                 "has_mask": has_mask,
+                 "mask": mask
+             }
+        return {
+             "logits": logits,
+             "seg_logits": seg_logits,
+             "seg_loss": seg_loss
+        }
+
+
+class FreqDINO_ablation2(nn.Module):
+    # Ablation 2: w/o BC-PCA (remove fused_clip from everywhere)
+    def __init__(self, n_fusion_layers=3, n_heads=8, d_model=768,
+                 dino_embed_size=1024, n_patches=196, clip_layers=12, num_classes=3,
+                 n_bands=3):
+        super().__init__()
+        self.dino_embed_size = dino_embed_size
+        self.n_patches = n_patches
+        self.grid = int(math.sqrt(n_patches))
+        self.n_bands = n_bands
+
+        self.freq = EnhancedFrequencyBank(in_ch=3, base_ch=64)
+        self.fft_bank = FFTBankv2(out_dim=dino_embed_size, grid=self.grid, n_bands=self.n_bands)
+        fft_out_ch = self.fft_bank.out_channels
+
+        self.clip_weight = ClipLayerWeighting(n_layers=clip_layers, embed_dim=768)
+        self.clip_proj = nn.Linear(768, d_model)
+        self.dino_proj = nn.Linear(dino_embed_size, d_model)
+        self.patch_proj = nn.Linear(dino_embed_size, d_model)
+        self.fft_to_dmodel = nn.Linear(fft_out_ch, d_model)
+        self.phase_to_dmodel = nn.Linear(fft_out_ch, d_model)
+
+        self.pos = PositionalEncoding(d_model, max_len=n_patches + 4)
+        self.cross_layers = nn.ModuleList([CrossAttentionLayer(d_model, n_heads) for _ in range(n_fusion_layers)])
+        
+        self.noise_bank = NoiseResidualBank(in_ch=3, base_ch=64, grid=self.grid)
+        noise_out_ch = self.noise_bank.out_channels
+        self.noise_to_dmodel = nn.Linear(noise_out_ch, d_model)
+        
+        # NO BC_PCA in this ablation
+
+        self.classifier_head = nn.Sequential(
+            nn.Linear(d_model * 3 + 64, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, num_classes)
+        )
+        self.seg_decoder = FusedSegmentationDecoder(
+            patch_dim=dino_embed_size,
+            freq_dim=fft_out_ch,
+            fused_dim=d_model,
+            patch_count=n_patches,
+            out_size=224,
+            mid_ch=512
+        )
+        self.aux_seg_proj = nn.Conv2d(64, 128, 1)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, image, clip_embed, dino_cls, dino_reg, dino_patch, has_mask=None, mask=None):
+        B = image.shape[0]
+
+        f = self.freq(image)
+        f_pool = F.adaptive_avg_pool2d(f, 1).view(B, -1)
+
+        clip_w = self.clip_weight(clip_embed)
+        clip_proj = self.clip_proj(clip_w)
+
+        patch_tokens = dino_patch
+        patch_proj = self.patch_proj(patch_tokens)
+        patch_seq = patch_proj.permute(1,0,2)
+
+        dino_cls_proj = self.dino_proj(dino_cls) if dino_cls.ndim==2 else self.dino_proj(dino_cls.view(B,-1))
+        dino_cls_tok = dino_cls_proj.unsqueeze(0)
+
+        mag_bands_raw, phase_bands_raw, fft_mag = self.fft_bank(image)
+        mag_bands = [self.fft_to_dmodel(band) for band in mag_bands_raw]
+        phase_bands = [self.phase_to_dmodel(band) for band in phase_bands_raw]
+
+        noise_tokens, noise_emphasis = self.noise_bank(image)
+        noise_proj_dmodel = self.noise_to_dmodel(noise_tokens)
+        noise_seq = noise_proj_dmodel.permute(1,0,2)
+        
+        # No fused_clip from BC-PCA
+
+        freq_proj_dmodel = torch.stack(mag_bands, dim=0).mean(dim=0)
+        freq_seq = freq_proj_dmodel.permute(1,0,2)
+
+        # Cross-attention without fused_clip
+        q2 = dino_cls_tok
+        k2 = torch.cat([patch_seq, noise_seq], dim=0)
+        v2 = k2
+        for layer in self.cross_layers:
+            q2 = layer(q2, k2, v2)
+        fused_dino_cls = q2.squeeze(0)
+
+        q3 = patch_seq
+        k3 = torch.cat([patch_seq, fused_dino_cls.unsqueeze(0)], dim=0)
+        v3 = k3
+        for layer in self.cross_layers:
+            q3 = layer(q3, k3, v3)
+        fused_patches = q3.permute(1, 0, 2)
+
+        # Classifier without fused_clip
+        cls_input = torch.cat([f_pool, fused_dino_cls, clip_proj], dim=1)
+        logits = self.classifier_head(cls_input)
+
+        seg_decoder_freq_tokens = mag_bands_raw[1]
+        seg_logits = self.seg_decoder(dino_patch, seg_decoder_freq_tokens, fused_patches)
+
+        seg_loss = None
+
+        if (mask is not None) and (has_mask is not None):
+             return {
+                 "logits": logits,
+                 "seg_logits": seg_logits,
+                 "seg_loss": seg_loss,
+                 "has_mask": has_mask,
+                 "mask": mask
+             }
+        return {
+             "logits": logits,
+             "seg_logits": seg_logits,
+             "seg_loss": seg_loss
+        }
+
+
+class FreqDINO_ablation3(nn.Module):
+    # Ablation 3: w/o BC-PCA and CLIP (remove both fused_clip and clip_tok)
+    def __init__(self, n_fusion_layers=3, n_heads=8, d_model=768,
+                 dino_embed_size=1024, n_patches=196, clip_layers=12, num_classes=3,
+                 n_bands=3):
+        super().__init__()
+        self.dino_embed_size = dino_embed_size
+        self.n_patches = n_patches
+        self.grid = int(math.sqrt(n_patches))
+        self.n_bands = n_bands
+
+        self.freq = EnhancedFrequencyBank(in_ch=3, base_ch=64)
+        self.fft_bank = FFTBankv2(out_dim=dino_embed_size, grid=self.grid, n_bands=self.n_bands)
+        fft_out_ch = self.fft_bank.out_channels
+
+        # NO CLIP components in this ablation
+        
+        self.dino_proj = nn.Linear(dino_embed_size, d_model)
+        self.patch_proj = nn.Linear(dino_embed_size, d_model)
+        self.fft_to_dmodel = nn.Linear(fft_out_ch, d_model)
+        self.phase_to_dmodel = nn.Linear(fft_out_ch, d_model)
+
+        self.pos = PositionalEncoding(d_model, max_len=n_patches + 4)
+        self.cross_layers = nn.ModuleList([CrossAttentionLayer(d_model, n_heads) for _ in range(n_fusion_layers)])
+        
+        self.noise_bank = NoiseResidualBank(in_ch=3, base_ch=64, grid=self.grid)
+        noise_out_ch = self.noise_bank.out_channels
+        self.noise_to_dmodel = nn.Linear(noise_out_ch, d_model)
+
+        self.classifier_head = nn.Sequential(
+            nn.Linear(d_model * 2 + 64, 1024),  # Adjusted input size
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, num_classes)
+        )
+        self.seg_decoder = FusedSegmentationDecoder(
+            patch_dim=dino_embed_size,
+            freq_dim=fft_out_ch,
+            fused_dim=d_model,
+            patch_count=n_patches,
+            out_size=224,
+            mid_ch=512
+        )
+        self.aux_seg_proj = nn.Conv2d(64, 128, 1)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, image, clip_embed, dino_cls, dino_reg, dino_patch, has_mask=None, mask=None):
+        B = image.shape[0]
+
+        f = self.freq(image)
+        f_pool = F.adaptive_avg_pool2d(f, 1).view(B, -1)
+
+        # No CLIP processing
+
+        patch_tokens = dino_patch
+        patch_proj = self.patch_proj(patch_tokens)
+        patch_seq = patch_proj.permute(1,0,2)
+
+        dino_cls_proj = self.dino_proj(dino_cls) if dino_cls.ndim==2 else self.dino_proj(dino_cls.view(B,-1))
+        dino_cls_tok = dino_cls_proj.unsqueeze(0)
+
+        mag_bands_raw, phase_bands_raw, fft_mag = self.fft_bank(image)
+        mag_bands = [self.fft_to_dmodel(band) for band in mag_bands_raw]
+        phase_bands = [self.phase_to_dmodel(band) for band in phase_bands_raw]
+
+        noise_tokens, noise_emphasis = self.noise_bank(image)
+        noise_proj_dmodel = self.noise_to_dmodel(noise_tokens)
+        noise_seq = noise_proj_dmodel.permute(1,0,2)
+
+        freq_proj_dmodel = torch.stack(mag_bands, dim=0).mean(dim=0)
+        freq_seq = freq_proj_dmodel.permute(1,0,2)
+
+        # Cross-attention without CLIP
+        q2 = dino_cls_tok
+        k2 = torch.cat([patch_seq, noise_seq], dim=0)
+        v2 = k2
+        for layer in self.cross_layers:
+            q2 = layer(q2, k2, v2)
+        fused_dino_cls = q2.squeeze(0)
+
+        q3 = patch_seq
+        k3 = torch.cat([patch_seq, fused_dino_cls.unsqueeze(0)], dim=0)
+        v3 = k3
+        for layer in self.cross_layers:
+            q3 = layer(q3, k3, v3)
+        fused_patches = q3.permute(1, 0, 2)
+
+        # Classifier without CLIP
+        cls_input = torch.cat([f_pool, fused_dino_cls], dim=1)
+        logits = self.classifier_head(cls_input)
+
+        seg_decoder_freq_tokens = mag_bands_raw[1]
+        seg_logits = self.seg_decoder(dino_patch, seg_decoder_freq_tokens, fused_patches)
+
+        seg_loss = None
+
+        if (mask is not None) and (has_mask is not None):
+             return {
+                 "logits": logits,
+                 "seg_logits": seg_logits,
+                 "seg_loss": seg_loss,
+                 "has_mask": has_mask,
+                 "mask": mask
+             }
+        return {
+             "logits": logits,
+             "seg_logits": seg_logits,
+             "seg_loss": seg_loss
+        }
+
+
+class FreqDINO_ablation4(nn.Module):
+    # Ablation 4: No DINO patches anywhere (remove patch tokens from all cross-attention and seg decoder)
+    def __init__(self, n_fusion_layers=3, n_heads=8, d_model=768,
+                 dino_embed_size=1024, n_patches=196, clip_layers=12, num_classes=3,
+                 n_bands=3):
+        super().__init__()
+        self.dino_embed_size = dino_embed_size
+        self.n_patches = n_patches
+        self.grid = int(math.sqrt(n_patches))
+        self.n_bands = n_bands
+
+        self.freq = EnhancedFrequencyBank(in_ch=3, base_ch=64)
+        self.fft_bank = FFTBankv2(out_dim=dino_embed_size, grid=self.grid, n_bands=self.n_bands)
+        fft_out_ch = self.fft_bank.out_channels
+
+        self.clip_weight = ClipLayerWeighting(n_layers=clip_layers, embed_dim=768)
+        self.clip_proj = nn.Linear(768, d_model)
+        self.dino_proj = nn.Linear(dino_embed_size, d_model)
+        # NO patch_proj since we're removing DINO patches
+        
+        self.fft_to_dmodel = nn.Linear(fft_out_ch, d_model)
+        self.phase_to_dmodel = nn.Linear(fft_out_ch, d_model)
+
+        self.pos = PositionalEncoding(d_model, max_len=n_patches + 4)
+        self.cross_layers = nn.ModuleList([CrossAttentionLayer(d_model, n_heads) for _ in range(n_fusion_layers)])
+        
+        self.noise_bank = NoiseResidualBank(in_ch=3, base_ch=64, grid=self.grid)
+        noise_out_ch = self.noise_bank.out_channels
+        self.noise_to_dmodel = nn.Linear(noise_out_ch, d_model)
+
+        self.classifier_head = nn.Sequential(
+            nn.Linear(d_model * 3 + 64, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, num_classes)
+        )
+        
+        # Seg decoder without patch_dim
+        self.seg_decoder = FusedSegmentationDecoder(
+            patch_dim=1,  # Dummy value since we won't use it
+            freq_dim=fft_out_ch,
+            fused_dim=d_model,
+            patch_count=n_patches,
+            out_size=224,
+            mid_ch=512
+        )
+        self.aux_seg_proj = nn.Conv2d(64, 128, 1)
+        self.norm = nn.LayerNorm(d_model)
+        self.bc_pca_clip = BC_PCA(d_model=d_model, n_bands=self.n_bands)
+
+    def forward(self, image, clip_embed, dino_cls, dino_reg, dino_patch, has_mask=None, mask=None):
+        B = image.shape[0]
+
+        f = self.freq(image)
+        f_pool = F.adaptive_avg_pool2d(f, 1).view(B, -1)
+
+        clip_w = self.clip_weight(clip_embed)
+        clip_proj = self.clip_proj(clip_w)
+
+        # No DINO patch processing
+
+        dino_cls_proj = self.dino_proj(dino_cls) if dino_cls.ndim==2 else self.dino_proj(dino_cls.view(B,-1))
+        dino_cls_tok = dino_cls_proj.unsqueeze(0)
+
+        mag_bands_raw, phase_bands_raw, fft_mag = self.fft_bank(image)
+        mag_bands = [self.fft_to_dmodel(band) for band in mag_bands_raw]
+        phase_bands = [self.phase_to_dmodel(band) for band in phase_bands_raw]
+
+        clip_tok_batch = clip_proj.unsqueeze(1)
+        
+        noise_tokens, noise_emphasis = self.noise_bank(image)
+        noise_proj_dmodel = self.noise_to_dmodel(noise_tokens)
+        noise_seq = noise_proj_dmodel.permute(1,0,2)
+        
+        fused_clip_batch = self.bc_pca_clip(clip_tok_batch, mag_bands, phase_bands)
+        fused_clip = fused_clip_batch.squeeze(1)
+
+        freq_proj_dmodel = torch.stack(mag_bands, dim=0).mean(dim=0)
+        freq_seq = freq_proj_dmodel.permute(1,0,2)
+
+        # Cross-attention without patch tokens
+        q2 = dino_cls_tok
+        k2 = torch.cat([noise_seq, fused_clip.unsqueeze(0)], dim=0)
+        v2 = k2
+        for layer in self.cross_layers:
+            q2 = layer(q2, k2, v2)
+        fused_dino_cls = q2.squeeze(0)
+
+        # Create dummy fused_patches for seg decoder
+        fused_patches = freq_proj_dmodel  # Use freq tokens as patches
+
+        cls_input = torch.cat([f_pool, fused_clip, fused_dino_cls, clip_proj], dim=1)
+        logits = self.classifier_head(cls_input)
+
+        seg_decoder_freq_tokens = mag_bands_raw[1]
+        # Pass dummy patch tokens
+        dummy_patches = torch.zeros(B, self.n_patches, 1, device=image.device)
+        seg_logits = self.seg_decoder(dummy_patches, seg_decoder_freq_tokens, fused_patches)
+
+        seg_loss = None
+
+        if (mask is not None) and (has_mask is not None):
+             return {
+                 "logits": logits,
+                 "seg_logits": seg_logits,
+                 "seg_loss": seg_loss,
+                 "has_mask": has_mask,
+                 "mask": mask
+             }
+        return {
+             "logits": logits,
+             "seg_logits": seg_logits,
+             "seg_loss": seg_loss
+        }
+
+
+class FreqDINO_ablation5(nn.Module):
+    # Ablation 5: ONLY DINO features (remove freq, noise, CLIP - keep only DINO cls and patches)
+    def __init__(self, n_fusion_layers=3, n_heads=8, d_model=768,
+                 dino_embed_size=1024, n_patches=196, clip_layers=12, num_classes=3,
+                 n_bands=3):
+        super().__init__()
+        self.dino_embed_size = dino_embed_size
+        self.n_patches = n_patches
+        self.grid = int(math.sqrt(n_patches))
+
+        # Only DINO projections
+        self.dino_proj = nn.Linear(dino_embed_size, d_model)
+        self.patch_proj = nn.Linear(dino_embed_size, d_model)
+
+        self.pos = PositionalEncoding(d_model, max_len=n_patches + 4)
+        self.cross_layers = nn.ModuleList([CrossAttentionLayer(d_model, n_heads) for _ in range(n_fusion_layers)])
+
+        self.classifier_head = nn.Sequential(
+            nn.Linear(d_model * 2, 1024),  # Only DINO cls and patches
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, num_classes)
+        )
+        
+        # Simple seg decoder for DINO patches only
+        self.seg_decoder = DinoPatchDecoder(
+            patch_dim=dino_embed_size,
+            freq_dim=0,  # No freq
+            patch_count=n_patches,
+            out_size=224,
+            mid_ch=512
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, image, clip_embed, dino_cls, dino_reg, dino_patch, has_mask=None, mask=None):
+        B = image.shape[0]
+
+        patch_tokens = dino_patch
+        patch_proj = self.patch_proj(patch_tokens)
+        patch_seq = patch_proj.permute(1,0,2)
+
+        dino_cls_proj = self.dino_proj(dino_cls) if dino_cls.ndim==2 else self.dino_proj(dino_cls.view(B,-1))
+        dino_cls_tok = dino_cls_proj.unsqueeze(0)
+
+        # Self-attention on DINO features only
+        q2 = dino_cls_tok
+        k2 = patch_seq
+        v2 = k2
+        for layer in self.cross_layers:
+            q2 = layer(q2, k2, v2)
+        fused_dino_cls = q2.squeeze(0)
+
+        q3 = patch_seq
+        k3 = torch.cat([patch_seq, fused_dino_cls.unsqueeze(0)], dim=0)
+        v3 = k3
+        for layer in self.cross_layers:
+            q3 = layer(q3, k3, v3)
+        fused_patches = q3.permute(1, 0, 2)
+
+        # Classifier with only DINO features
+        pooled_patches = fused_patches.mean(dim=1)
+        cls_input = torch.cat([fused_dino_cls, pooled_patches], dim=1)
+        logits = self.classifier_head(cls_input)
+
+        # Seg decoder with only DINO patches
+        seg_logits = self.seg_decoder(dino_patch, freq_patch_tokens=None, fft_mag=None)
+
+        seg_loss = None
+
+        if (mask is not None) and (has_mask is not None):
+             return {
+                 "logits": logits,
+                 "seg_logits": seg_logits,
+                 "seg_loss": seg_loss,
+                 "has_mask": has_mask,
+                 "mask": mask
+             }
+        return {
+             "logits": logits,
+             "seg_logits": seg_logits,
+             "seg_loss": seg_loss
+        }
+
+
 
 
 if __name__ == "__main__":
