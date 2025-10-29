@@ -13,8 +13,8 @@ from torchvision.utils import make_grid
 import torchvision.transforms as T
 from sklearn.metrics import f1_score
 from src.utils import SIDADataset
-from src.models import FreqDINOv2  
-from src.loss import CombinedSegmentationLoss  
+from src.models import FreqDINO
+from src.loss import CombinedSegmentationLoss, CrossModalContrastiveLoss
 import random
 from tqdm.auto import tqdm
 from datasets import load_dataset, load_from_disk
@@ -24,10 +24,11 @@ from torchvision.transforms.functional import InterpolationMode
 LOCAL_DS_DIR = Path("/home/arush/deepfake/sida_net/datasets/SID_Set")
 
 
+
 CFG = {
     "project": "deepfake-freq-dinov3-final",
     "entity": None,
-    "epochs": 30,
+    "epochs": 20,
     "batch_size": 32,
     "val_batch_size": 32,
     "lr": 1e-4,
@@ -42,9 +43,10 @@ CFG = {
     "cls_loss_weight": 1.0,
     "focal_alpha": 0.25,
     "focal_gamma": 2.0,
-    "checkpoint_dir": "./checkpoints_v2",
+    "checkpoint_dir": "./checkpoints_fft_phase",
     "project_tags": ["freq", "dino", "clip", "segmentation", "fixed"],
     "num_classes": 3,
+    "run_name": "freq_dino_main"
 }
 os.makedirs(CFG["checkpoint_dir"], exist_ok=True)
 
@@ -216,7 +218,7 @@ val_loader = DataLoader(val_ds, batch_size=CFG["val_batch_size"], shuffle=False,
 
 # Initialize model and losses
 device = torch.device(CFG["device"])
-model = FreqDINOv2(num_classes=CFG["num_classes"]).to(device)
+model = FreqDINO(num_classes=CFG["num_classes"]).to(device)
 
 # Separate optimizers for classification and segmentation
 cls_params = [p for n, p in model.named_parameters() if 'seg_decoder' not in n]
@@ -238,11 +240,12 @@ criterion_seg = CombinedSegmentationLoss(
     focal_alpha=CFG["focal_alpha"],
     focal_gamma=CFG["focal_gamma"]
 )
+# criterion_contrastive = CrossModalContrastiveLoss(temperature=0.1)
 
 # WandB
 wandb_mode = os.getenv("WANDB_MODE", "online")
 wandb.init(project=CFG["project"], entity=CFG["entity"], config=CFG, 
-           tags=CFG["project_tags"], mode=wandb_mode)
+           tags=CFG["project_tags"], mode=wandb_mode, name = CFG['run_name'])
 wandb.watch(model, log="all", log_freq=100)
 
 

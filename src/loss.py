@@ -122,3 +122,61 @@ class DiceLossOG(nn.Module):
 
         return dice_loss
 
+
+class CrossModalContrastiveLoss(nn.Module):
+    # 
+    # For real images: SRM noise patterns somewhat equal to camera sensor noise (consistent with DL features)
+    # For fake images: SRM detects GAN artifacts that DL features might miss
+    #
+    # Loss encourages: same-class samples cluster together in BOTH feature spaces
+    #                  different-class samples pushed apart in BOTH spaces
+    
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temp = temperature
+    
+    def forward(self, noise_features, dl_features, labels):
+        # noise_features: (B, D) - pooled noise residual features
+        # dl_features: (B, D) - pooled DINO/CLIP features  
+        # labels: (B,) - class labels {0: real, 1: fake, 2: tampered}
+        
+        B = noise_features.shape[0]
+        
+        # L2 normalize both feature types
+        # Puts features on unit hypersphere (distance = angular separation)
+        noise_norm = F.normalize(noise_features, p=2, dim=1)  # (B, D)
+        dl_norm = F.normalize(dl_features, p=2, dim=1)  # (B, D)
+        
+        # Compute cross-modal similarity: how aligned are noise and DL features?
+        # High similarity → consistent representations (likely real)
+        # Low similarity → disagreement (suspicious, likely fake)
+        cross_sim = torch.matmul(noise_norm, dl_norm.T) / self.temp  # (B, B)
+        
+        # Create label mask: which samples share the same class?
+        labels = labels.contiguous().view(-1, 1)
+        mask_pos = torch.eq(labels, labels.T).float()  # (B, B) - 1 if same class
+        mask_neg = 1 - mask_pos  # Different class
+        
+        # Remove diagonal (self-similarity)
+        mask_pos = mask_pos - torch.eye(B).to(mask_pos.device)
+        
+        # Compute InfoNCE-style contrastive loss
+        # Numerator: similarity to positive pairs (same class)
+        # Denominator: similarity to all pairs (normalization)
+        exp_sim = torch.exp(cross_sim)
+        
+        # Sum over positive pairs
+        pos_sum = (exp_sim * mask_pos).sum(dim=1)  # (B,)
+        
+        # Sum over all pairs (for normalization)
+        all_sum = exp_sim.sum(dim=1)  # (B,)
+        
+        # Log probability of positive pairs
+        # High when positive pairs are similar, negatives are dissimilar
+        log_prob = torch.log(pos_sum / (all_sum + 1e-8) + 1e-8)
+        
+        # Mean over batch
+        loss = -log_prob.mean()
+        
+        return loss
+
