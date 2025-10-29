@@ -63,6 +63,14 @@ run_experiment() {
 declare -a success_experiments
 declare -a failed_experiments
 
+#experiment 0: Ablation with contrastive loss
+if run_experiment "ablation0" "freq_dino_ablation0_contrastive"; then
+    success_experiments+=("ablation0")
+else
+    failed_experiments+=("ablation0")
+fi
+
+
 # Experiment 1: Baseline (Full Model)
 if run_experiment "baseline" "freq_dino_baseline"; then
     success_experiments+=("baseline")

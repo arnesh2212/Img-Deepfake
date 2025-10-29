@@ -26,8 +26,8 @@ except ImportError:
 
 from src.utils import SIDADataset
 from src.models import (FreqDINO, FreqDINO_ablation1, FreqDINO_ablation2, 
-                        FreqDINO_ablation3, FreqDINO_ablation4, FreqDINO_ablation5)
-from src.loss import CombinedSegmentationLoss
+                        FreqDINO_ablation3, FreqDINO_ablation4, FreqDINO_ablation5, FreqDINO_ablation0)
+from src.loss import CombinedSegmentationLoss, CrossModalContrastiveLoss
 import random
 from tqdm.auto import tqdm
 from datasets import load_from_disk
@@ -39,7 +39,7 @@ from torchvision.transforms.functional import InterpolationMode
 # Argument parser
 parser = argparse.ArgumentParser(description="Train and Test FreqDINO Ablations")
 parser.add_argument('--model', type=str, default='baseline', 
-                    choices=['baseline', 'ablation1', 'ablation2', 'ablation3', 'ablation4', 'ablation5'],
+                    choices=['baseline', 'ablation1', 'ablation2', 'ablation3', 'ablation4', 'ablation5', 'ablation0'],
                     help='Model variant to train')
 parser.add_argument('--run_name', type=str, default=None, help='WandB run name')
 parser.add_argument('--gpu', type=str, default='3', help='GPU device ID')
@@ -52,6 +52,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 # Model mapping
 MODEL_MAP = {
     'baseline': FreqDINO,
+    'ablation0': FreqDINO_ablation0,
     'ablation1': FreqDINO_ablation1,
     'ablation2': FreqDINO_ablation2,
     'ablation3': FreqDINO_ablation3,
@@ -95,6 +96,7 @@ CFG = {
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "seg_loss_weight": 1.0,
     "cls_loss_weight": 1.0,
+    "contrast_loss_weight": 0.3,
     "focal_alpha": 0.25,
     "focal_gamma": 2.0,
     "checkpoint_dir": str(CHECKPOINT_DIR),
@@ -302,6 +304,7 @@ criterion_seg = CombinedSegmentationLoss(
     focal_alpha=CFG["focal_alpha"],
     focal_gamma=CFG["focal_gamma"]
 )
+criterion_contrast = CrossModalContrastiveLoss(temperature=0.1)
 
 # WandB
 wandb_mode = os.getenv("WANDB_MODE", "online")
@@ -323,6 +326,7 @@ def train_one_epoch(epoch):
     running_loss = 0.0
     running_cls_loss = 0.0
     running_seg_loss = 0.0
+    running_contrast_loss = 0.0
     total = 0
     correct = 0
     all_preds = []
@@ -361,6 +365,16 @@ def train_one_epoch(epoch):
                 seg_loss_val = seg_loss.item()
                 total_loss = total_loss + CFG["seg_loss_weight"] * seg_loss
                 seg_samples += len(valid_mask_indices)
+                
+            #only for ablation with contrastive loss (ablation 0 that is
+            contrast_loss_val = 0.0
+            if "noise_contrast" in out and "dino_contrast" in out:
+                noise_feats = out["noise_contrast"]
+                dino_feats = out["dino_contrast"]
+                
+                contrast_loss = criterion_contrast(noise_feats, dino_feats, labels)
+                contrast_loss_val = contrast_loss.item()  
+                total_loss = total_loss + CFG["contrast_loss_weight"] * contrast_loss
         
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
@@ -372,6 +386,8 @@ def train_one_epoch(epoch):
         running_cls_loss += cls_loss.item() * images.size(0)
         running_seg_loss += seg_loss_val * images.size(0)
         
+        running_contrast_loss += contrast_loss_val * images.size(0)
+        
         preds = torch.argmax(logits, dim=1)
         correct += (preds == labels).sum().item()
         total += images.size(0)
@@ -380,19 +396,23 @@ def train_one_epoch(epoch):
         all_labels.append(labels.detach().cpu())
         
         if (step + 1) % CFG["log_interval"] == 0:
-            wandb.log({
-                "train/lr": optimizer.param_groups[0]["lr"],
+            log_dict = {
+                "train/lr" : optimizer.param_groups[0]["lr"],
                 "train/seg_lr": optimizer.param_groups[1]["lr"],
                 "train/step_loss": total_loss.item(),
                 "train/cls_loss": cls_loss.item(),
                 "train/seg_loss": seg_loss_val,
                 "epoch": epoch,
                 "step": epoch * len(train_loader) + step
-            })
+            }
+            if contrast_loss_val > 0.0:
+                log_dict["train/contrast_loss"] = contrast_loss_val
+            wandb.log(log_dict)
     
     avg_loss = running_loss / total
     avg_cls = running_cls_loss / total
     avg_seg = (running_seg_loss / total) if seg_samples > 0 else 0.0
+    avg_contrast = running_contrast_loss / total
     acc = correct / total
     
     preds_cat = torch.cat(all_preds, dim=0).numpy()
@@ -406,7 +426,7 @@ def train_one_epoch(epoch):
                                          torch.tensor(labels_cat), CFG["num_classes"])
         train_f1_micro = 0.0
     
-    wandb.log({
+    log_dict = {
         "train/epoch_loss": avg_loss,
         "train/cls_loss_epoch": avg_cls,
         "train/seg_loss_epoch": avg_seg,
@@ -415,9 +435,16 @@ def train_one_epoch(epoch):
         "train/f1_micro": train_f1_micro,
         "train/seg_samples": seg_samples,
         "epoch": epoch
-    })
+    }
+    if avg_contrast > 0.0:
+        log_dict["train/contrast_loss_epoch"] = avg_contrast
     
-    msg = f"Epoch {epoch} Train - Loss: {avg_loss:.4f}, Acc: {acc:.4f}, F1_macro: {train_f1_macro:.4f}, F1_micro: {train_f1_micro:.4f}"
+    wandb.log(log_dict)
+    
+    if avg_contrast > 0.0:
+        msg = f"Epoch {epoch} Train - Loss: {avg_loss:.4f}, Acc: {acc:.4f}, F1_macro: {train_f1_macro:.4f}, F1_micro: {train_f1_micro:.4f}, Contrast_Loss: {avg_contrast:.4f}"
+    else:
+        msg = f"Epoch {epoch} Train - Loss: {avg_loss:.4f}, Acc: {acc:.4f}, F1_macro: {train_f1_macro:.4f}, F1_micro: {train_f1_micro:.4f}"
     log_message(msg)
     
     return avg_loss, acc, train_f1_macro
@@ -468,11 +495,18 @@ def validate(epoch, num_visuals=4):
                 seg_loss_val = seg_loss.item()
                 total_loss = total_loss + CFG["seg_loss_weight"] * seg_loss
                 
+            
                 for p, g in zip(seg_pred, seg_gt):
                     iou_sum += iou_score(p.unsqueeze(0), g.unsqueeze(0)).item()
                     iou_count += 1
-                
                 seg_samples += len(valid_mask_indices)
+                
+                
+            if "noise_contrast" in out and "dino_contrast" in out:
+                contrast_loss = criterion_contrast(out["noise_contrast"], out["dino_contrast"], labels)
+                total_loss = total_loss + CFG["contrast_loss_weight"] * contrast_loss
+                
+                
         
         running_loss += total_loss.item() * images.size(0)
         running_cls_loss += cls_loss.item() * images.size(0)
