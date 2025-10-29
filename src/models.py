@@ -1152,7 +1152,7 @@ class FreqDINO_ablation2(nn.Module):
         # NO BC_PCA in this ablation
 
         self.classifier_head = nn.Sequential(
-            nn.Linear(d_model * 3 + 64, 1024),
+            nn.Linear(d_model * 2 + 64, 1024),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(1024, num_classes)
@@ -1266,7 +1266,7 @@ class FreqDINO_ablation3(nn.Module):
         self.noise_to_dmodel = nn.Linear(noise_out_ch, d_model)
 
         self.classifier_head = nn.Sequential(
-            nn.Linear(d_model * 2 + 64, 1024),  # Adjusted input size
+            nn.Linear(d_model + 64, 1024),  # Adjusted input size
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(1024, num_classes)
@@ -1292,7 +1292,7 @@ class FreqDINO_ablation3(nn.Module):
 
         patch_tokens = dino_patch
         patch_proj = self.patch_proj(patch_tokens)
-        patch_seq = patch_proj.permute(1,0,2)
+        patch_seq = patch_proj.permute(1,0,2) # 
 
         dino_cls_proj = self.dino_proj(dino_cls) if dino_cls.ndim==2 else self.dino_proj(dino_cls.view(B,-1))
         dino_cls_tok = dino_cls_proj.unsqueeze(0)
@@ -1386,7 +1386,7 @@ class FreqDINO_ablation4(nn.Module):
         
         # Seg decoder without patch_dim
         self.seg_decoder = FusedSegmentationDecoder(
-            patch_dim=1,  # Dummy value since we won't use it
+            patch_dim=fft_out_ch, #using 
             freq_dim=fft_out_ch,
             fused_dim=d_model,
             patch_count=n_patches,
@@ -1434,19 +1434,35 @@ class FreqDINO_ablation4(nn.Module):
         for layer in self.cross_layers:
             q2 = layer(q2, k2, v2)
         fused_dino_cls = q2.squeeze(0)
-
-        # Create dummy fused_patches for seg decoder
-        fused_patches = freq_proj_dmodel  # Use freq tokens as patches
-
+        
+#removing cross attention with patch tokens  and keeping seg_decoder_freq_tokens only in seg decoder
+        seg_decoder_freq_tokens = mag_bands_raw[1]
+        fused_patches = freq_proj_dmodel  # Using freq tokens as "fused_patches" input
         cls_input = torch.cat([f_pool, fused_clip, fused_dino_cls, clip_proj], dim=1)
         logits = self.classifier_head(cls_input)
-
-        seg_decoder_freq_tokens = mag_bands_raw[1]
-        # Pass dummy patch tokens
-        dummy_patches = torch.zeros(B, self.n_patches, 1, device=image.device)
-        seg_logits = self.seg_decoder(dummy_patches, seg_decoder_freq_tokens, fused_patches)
-
+        
+        seg_logits = self.seg_decoder(seg_decoder_freq_tokens, seg_decoder_freq_tokens, fused_patches)
         seg_loss = None
+#what was orignal ->
+
+        # q3 = patch_seq
+        # k3 = torch.cat([patch_seq, fused_clip.unsqueeze(0), fused_dino_cls.unsqueeze(0)], dim=0)
+        # v3 = k3
+        # for layer in self.cross_layers:
+        #     q3 = layer(q3, k3, v3)
+        # fused_patches = q3.permute(1, 0, 2)  # (B, P, d_model)
+
+        # cls_input = torch.cat([f_pool, fused_clip, fused_dino_cls, clip_proj], dim=1)
+        # logits = self.classifier_head(cls_input)
+
+
+        # seg_decoder_freq_tokens = mag_bands_raw[1] #
+        
+        # seg_logits = self.seg_decoder(dino_patch, seg_decoder_freq_tokens, fused_patches)
+
+        # seg_loss = None
+        
+        
 
         if (mask is not None) and (has_mask is not None):
              return {
@@ -1564,3 +1580,29 @@ if __name__ == "__main__":
                 has_mask=has_mask, mask=mask)
     print("Logits shape:", out["logits"].shape)
     print("Seg logits shape:", out["seg_logits"].shape)
+    #check dims of all ablation models too
+    model_ab1 = FreqDINO_ablation1()
+    out_ab1 = model_ab1(image, clip_embed, dino_cls, dino_reg, dino_patch, 
+                has_mask=has_mask, mask=mask)
+    print("Ab1 - Logits shape:", out_ab1["logits"].shape)
+    print("Ab1 - Seg logits shape:", out_ab1["seg_logits"].shape)
+    model_ab2 = FreqDINO_ablation2()
+    out_ab2 = model_ab2(image, clip_embed, dino_cls, dino_reg, dino_patch, 
+                has_mask=has_mask, mask=mask)
+    print("Ab2 - Logits shape:", out_ab2["logits"].shape)
+    print("Ab2 - Seg logits shape:", out_ab2["seg_logits"].shape)
+    model_ab3 = FreqDINO_ablation3()
+    out_ab3 = model_ab3(image, clip_embed, dino_cls, dino_reg, dino_patch, 
+                has_mask=has_mask, mask=mask)
+    print("Ab3 - Logits shape:", out_ab3["logits"].shape)
+    print("Ab3 - Seg logits shape:", out_ab3["seg_logits"].shape)   
+    model_ab4 = FreqDINO_ablation4()
+    out_ab4 = model_ab4(image, clip_embed, dino_cls, dino_reg, dino_patch, 
+                has_mask=has_mask, mask=mask)
+    print("Ab4 - Logits shape:", out_ab4["logits"].shape)
+    print("Ab4 - Seg logits shape:", out_ab4["seg_logits"].shape)
+    model_ab5 = FreqDINO_ablation5()
+    out_ab5 = model_ab5(image, clip_embed, dino_cls, dino_reg, dino_patch, 
+                has_mask=has_mask, mask=mask)
+    print("Ab5 - Logits shape:", out_ab5["logits"].shape)
+    print("Ab5 - Seg logits shape:", out_ab5["seg_logits"].shape)
